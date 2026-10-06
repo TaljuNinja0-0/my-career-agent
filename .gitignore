@@ -1,0 +1,13 @@
+# Environment variables (DO NOT COMMIT)
+.env
+.env.local
+.env.*.local
+*.env
+
+# Configs & Scratch
+config.js
+scratch/
+node_modules/
+
+.vercel
+.env*
