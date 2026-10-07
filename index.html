@@ -15,6 +15,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <!-- Marked.js for Markdown -->
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
   <!-- Chart.js for Visual Match Graph -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
@@ -453,6 +454,9 @@
     let turnCount = 0;
     const MAX_TURNS = 10;
     let jobStore = [];
+    let lastMySkills = [];
+    let runId = 0;
+    let quotaExhausted = false;
     let pendingResolveUserReply = null;
 
     function toggleApiKeyVisibility() {
@@ -544,6 +548,8 @@
     }
 
     function resetAll() {
+      runId++;
+      quotaExhausted = false;
       turnCount = 0;
       jobStore = [];
       conversationHistory = [];
@@ -565,11 +571,19 @@
     // GUARANTEED NON-STOP INFINITE RETRY LOOP WITH SMART GROUNDING FALLBACK
     async function fetchGeminiDirect(requestPayload) {
       const TARGET_MODEL = 'gemini-3.5-flash-lite';
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${TARGET_MODEL}:generateContent?key=${apiKey}`;
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${TARGET_MODEL}:generateContent`;
+
+      if (quotaExhausted) {
+        const exhausted = new Error('Gemini 쿼터가 이미 소진되어 요청하지 않습니다');
+        exhausted.fatal = true;
+        throw exhausted;
+      }
 
       const SAFE_PRE_WAIT_MS = 4000;
+      const MAX_RATE_LIMIT_HITS = 5;
       let backoffMs = 5000;
       let totalAttempts = 0;
+      let rateLimitHits = 0;
 
       const pulse = document.getElementById('livePulseStatus');
       const badge = document.getElementById('activeModelBadge');
@@ -584,16 +598,10 @@
         totalAttempts++;
         if (badge) badge.innerText = `${TARGET_MODEL} (호출 중 - ${totalAttempts}회차)`;
 
-        // Grounding Quota Lock Relief: If 429 repeats >= 2 times, strip 'tools' (google_search) to bypass Grounding Quota Lock
-        if (totalAttempts >= 2 && currentPayload.tools) {
-          delete currentPayload.tools;
-          appendLog('ERROR', `💡 [Grounding 쿼터 락 우회] 구글 검색 옵션을 정제하여 즉시 재요청합니다.`);
-        }
-
         try {
           const response = await fetch(url, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
             body: JSON.stringify(currentPayload)
           });
 
@@ -601,31 +609,35 @@
             const data = await response.json();
             const candidate = data.candidates?.[0];
             const parts = candidate?.content?.parts || [];
-            let text = parts.map(p => p.text || '').join('').trim();
-
-            // Instant Auto-Fill Guarantee for 200 OK empty responses
-            if (!text) {
-              appendLog('ERROR', `💡 [응답 자동 보완] 구글 AI 200 OK 공백 수신 ➔ 표준 에이전트 구조 0초 자동 보완 완수`);
-              let fallbackObj = {};
-              if (jobStore.length === 0) {
-                fallbackObj = { thought: "실시간 채용 공고를 수집합니다.", action: "searchJobs", args: { query: targetJob || "백엔드 개발자" } };
-              } else {
-                fallbackObj = { thought: "수집된 공고의 적합도를 계산합니다.", action: "rankJobs", args: { mySkills: ["Java", "Spring Boot", "MySQL", "Git"], topN: 3 } };
-              }
-              text = JSON.stringify(fallbackObj);
-              data.candidates = [{ content: { parts: [{ text: text }] } }];
-            }
-
             if (badge) badge.innerText = `${TARGET_MODEL} (연결 성공)`;
             if (pulse) pulse.className = "w-3 h-3 rounded-full bg-emerald-500 animate-pulse";
             return data;
-          } else {
-            const status = response.status;
-            if (pulse) pulse.className = "w-3 h-3 rounded-full bg-amber-500 animate-ping";
-            appendLog('ERROR', `⏳ [${TARGET_MODEL} API 한도 (HTTP ${status})] ${(backoffMs / 1000).toFixed(0)}초 후 자동 재시도... (${totalAttempts}회차)`);
           }
 
+          const status = response.status;
+          if (status !== 429 && status < 500) {
+            const fatal = new Error(`Gemini API HTTP ${status}: 요청이 거부되었습니다 (API 키 또는 요청 형식을 확인하세요)`);
+            fatal.fatal = true;
+            throw fatal;
+          }
+          if (status === 429) {
+            rateLimitHits++;
+            const detail = await response.text().catch(() => '');
+            const isDaily = /PerDay|per_day|daily/i.test(detail);
+            if (isDaily || rateLimitHits >= MAX_RATE_LIMIT_HITS) {
+              quotaExhausted = true;
+              const quota = new Error(isDaily
+                ? 'Gemini 무료 쿼터 소진 (일일 한도) — 재시도를 중단합니다'
+                : `Gemini 쿼터 소진 (429 ${rateLimitHits}회 연속) — 재시도를 중단합니다`);
+              quota.fatal = true;
+              throw quota;
+            }
+          }
+          if (pulse) pulse.className = "w-3 h-3 rounded-full bg-amber-500 animate-ping";
+          appendLog('ERROR', `⏳ [${TARGET_MODEL} API 한도 (HTTP ${status})] ${(backoffMs / 1000).toFixed(0)}초 후 자동 재시도... (${totalAttempts}회차)`);
+
         } catch (e) {
+          if (e.fatal) throw e;
           if (pulse) pulse.className = "w-3 h-3 rounded-full bg-amber-500 animate-ping";
           appendLog('ERROR', `📡 [${TARGET_MODEL} 통신 대기] ${(backoffMs / 1000).toFixed(0)}초 후 재호출... (${totalAttempts}회차)`);
         }
@@ -654,7 +666,7 @@
           missingReq.push(skill);
         }
       });
-      const reqScore = reqSkills.length > 0 ? (reqMatchedCount / reqSkills.length) * 60 : 60;
+      const reqScore = reqSkills.length > 0 ? (reqMatchedCount / reqSkills.length) * 60 : 0;
 
       let prefMatchedCount = 0;
       const matchedPref = [];
@@ -707,7 +719,8 @@
         appendLog('TOOL_RESULT', 'searchCompanyInfo 완료', result);
         return result;
       } catch (err) {
-        return { company: companyName, summary: "기업 정보 수집 완료" };
+        appendLog('ERROR', 'searchCompanyInfo 실패', err.message);
+        return { company: companyName, error: err.message };
       }
     }
 
@@ -715,6 +728,7 @@
       const mySkills = args.mySkills || [];
       const userLevel = args.myLevel || myLevel;
       const topN = args.topN || 3;
+      lastMySkills = mySkills;
 
       appendLog('TOOL_CALL', 'rankJobs 호출', args);
       if (jobStore.length === 0) return { error: "수집된 공고가 없습니다." };
@@ -749,6 +763,7 @@
       const mySkills = args.mySkills || [];
       const jobIds = args.jobIds || [];
       const userLevel = args.myLevel || myLevel;
+      lastMySkills = mySkills;
 
       appendLog('TOOL_CALL', 'matchScore 호출', args);
       const targetJobs = jobIds.map(id => jobStore.find(j => j.id === id)).filter(Boolean);
@@ -789,46 +804,35 @@
         const searchQueries = groundingMetadata.webSearchQueries || [query];
         const groundingChunks = groundingMetadata.groundingChunks || [];
         const extractedUrls = groundingChunks.map(c => c.web?.uri).filter(Boolean);
+        const groundedDomains = groundingChunks.map(c => (c.web?.title || '').toLowerCase().replace(/^www\./, '')).filter(Boolean);
+        const isGroundedUrl = (u) => {
+          if (extractedUrls.includes(u)) return true;
+          try {
+            const host = new URL(u).hostname.replace(/^www\./, '');
+            return groundedDomains.some(d => host === d || host.endsWith('.' + d));
+          } catch (e) {
+            return false;
+          }
+        };
 
         let responseText = candidate?.content?.parts?.[0]?.text || '[]';
         responseText = responseText.replace(/```json/g, '').replace(/```/g, '').trim();
 
-        let parsedJobs = [];
+        let parsedJobs;
         try {
           parsedJobs = JSON.parse(responseText);
         } catch (e) {
-          parsedJobs = [
-            {
-              company: "우아한형제들",
-              title: `${query} 담당자`,
-              level: "신입/경력",
-              requiredSkills: ["Java", "Spring Boot", "MySQL", "Git"],
-              preferredSkills: ["Redis", "JPA"],
-              url: extractedUrls[0] || "https://career.woowahan.com"
-            },
-            {
-              company: "네이버",
-              title: `${query} 엔지니어`,
-              level: "신입",
-              requiredSkills: ["Java", "Python", "SQL"],
-              preferredSkills: ["Cloud", "Docker"],
-              url: extractedUrls[1] || "https://recruit.navercorp.com"
-            },
-            {
-              company: "카카오",
-              title: `${query} 개발자`,
-              level: "무관",
-              requiredSkills: ["Spring", "MySQL", "Git"],
-              preferredSkills: ["Linux", "MSA"],
-              url: extractedUrls[2] || "https://careers.kakao.com"
-            }
-          ];
+          appendLog('ERROR', '공고 목록 JSON 파싱 실패 — 공고를 추가하지 않습니다', responseText.slice(0, 300));
+          return { error: "검색 결과를 공고 목록으로 읽지 못했습니다. 검색어를 바꿔 다시 시도하세요.", searchQueriesUsed: searchQueries };
+        }
+        if (!Array.isArray(parsedJobs)) {
+          return { error: "검색 결과가 공고 배열이 아닙니다.", searchQueriesUsed: searchQueries };
         }
 
-        const newJobs = parsedJobs.map((job, idx) => {
+        const newJobs = parsedJobs.map((job) => {
           const jobId = jobStore.length + 1;
-          const assignedUrl = job.url || extractedUrls[idx] || extractedUrls[0] || '';
-          const isTrusted = assignedUrl.startsWith('http');
+          const assignedUrl = typeof job.url === 'string' ? job.url : '';
+          const isTrusted = /^https?:\/\//.test(assignedUrl) && isGroundedUrl(assignedUrl);
           
           const fullJob = {
             id: jobId,
@@ -849,6 +853,7 @@
 
         const toolResult = {
           searchQueriesUsed: searchQueries,
+          groundedSources: groundedDomains,
           groundedUrlsFound: extractedUrls.length,
           newJobsAdded: newJobs.length,
           jobs: newJobs
@@ -858,7 +863,7 @@
         return toolResult;
 
       } catch (err) {
-        appendLog('ERROR', 'searchJobs 처리 완료', err.message);
+        appendLog('ERROR', 'searchJobs 실패', err.message);
         return { error: err.message };
       }
     }
@@ -899,7 +904,7 @@
 
           <div class="pt-1 border-t border-slate-800/60 flex items-center justify-between text-[10px]">
             <span class="text-slate-500">검색어: ${escapeHtml(job.searchQueryUsed)}</span>
-            ${job.url ? `<a href="${job.url}" target="_blank" class="text-purple-400 hover:underline flex items-center gap-1 font-medium">원문 보기 <i class="fa-solid fa-arrow-up-right-from-square text-[9px]"></i></a>` : '<span class="text-slate-600">링크없음</span>'}
+            ${/^https?:\/\//.test(job.url) ? `<a href="${escapeHtml(job.url)}" target="_blank" rel="noopener noreferrer" class="text-purple-400 hover:underline flex items-center gap-1 font-medium">원문 보기 <i class="fa-solid fa-arrow-up-right-from-square text-[9px]"></i></a>` : '<span class="text-slate-600">링크없음</span>'}
           </div>
         </div>
       `).join('');
@@ -921,10 +926,10 @@
         return;
       }
 
+      resetAll();
       document.getElementById('startAgentBtn').disabled = true;
       document.getElementById('startAgentBtn').classList.add('opacity-50', 'cursor-not-allowed');
 
-      resetAll();
       updateStepIndicator(1);
       appendLog('THOUGHT', '에이전트 세션 시작', `희망직무: ${targetJob || '자동추론'}, 경력: ${myLevel}`);
 
@@ -971,8 +976,15 @@ ${targetJob ? `희망 직무: ${targetJob}` : '희망 직무: 자기소개서에
       return null;
     }
 
+    function enableStartButton() {
+      document.getElementById('startAgentBtn').disabled = false;
+      document.getElementById('startAgentBtn').classList.remove('opacity-50', 'cursor-not-allowed');
+    }
+
     async function runAgentLoop() {
+      const myRun = runId;
       while (turnCount < MAX_TURNS) {
+        if (myRun !== runId) return;
         turnCount++;
         document.getElementById('turnBadge').innerText = `Turn ${turnCount} / ${MAX_TURNS}`;
         appendLog('THOUGHT', `Turn ${turnCount} 모델 추론 요청 중...`, 'gemini-3.5-flash-lite 단일 호출...');
@@ -983,8 +995,17 @@ ${targetJob ? `희망 직무: ${targetJob}` : '희망 직무: 자기소개서에
           generationConfig: { temperature: 0.2, responseMimeType: "application/json" }
         };
 
-        // Guaranteed response from gemini-3.5-flash-lite via endless retry loop
-        const data = await fetchGeminiDirect(requestBody);
+        let data;
+        try {
+          data = await fetchGeminiDirect(requestBody);
+        } catch (err) {
+          if (myRun !== runId) return;
+          appendLog('ERROR', 'Gemini 호출 실패 — 에이전트를 중단합니다', err.message);
+          enableStartButton();
+          return;
+        }
+        if (myRun !== runId) return;
+
         const candidate = data.candidates?.[0];
         const parts = candidate?.content?.parts || [];
         const modelText = parts.map(p => p.text || '').join('').trim();
@@ -992,12 +1013,9 @@ ${targetJob ? `희망 직무: ${targetJob}` : '희망 직무: 자기소개서에
         let parsedObj = safeParseAgentJSON(modelText);
 
         if (!parsedObj) {
-          appendLog('ERROR', '⚠️ [JSON 구조 복원 안전장치] JSON 파싱 경고 ➔ 자동 응답 구조 복원');
-          if (jobStore.length === 0) {
-            parsedObj = { thought: "실시간 채용 공고를 수집합니다.", action: "searchJobs", args: { query: targetJob || "백엔드 개발자" } };
-          } else {
-            parsedObj = { thought: "수집된 공고의 직무 적합도를 정렬합니다.", action: "rankJobs", args: { mySkills: ["Java", "Spring Boot", "MySQL", "Git"], topN: 3 } };
-          }
+          appendLog('ERROR', '⚠️ 모델 응답이 JSON 형식이 아님 — 형식을 지정해 다시 요청합니다', modelText.slice(0, 300));
+          conversationHistory.push({ role: "user", parts: [{ text: "[시스템] 응답이 올바른 JSON 객체가 아니었습니다. 지정된 형식의 JSON 객체 하나로만 다시 답하세요." }] });
+          continue;
         }
 
         conversationHistory.push({ role: "model", parts: [{ text: JSON.stringify(parsedObj) }] });
@@ -1091,7 +1109,11 @@ ${targetJob ? `희망 직무: ${targetJob}` : '희망 직무: 자기소개서에
       const card = document.getElementById('finalReportCard');
       const outputDiv = document.getElementById('markdownOutput');
       
-      outputDiv.innerHTML = marked.parse(markdownText);
+      if (window.DOMPurify) {
+        outputDiv.innerHTML = DOMPurify.sanitize(marked.parse(markdownText));
+      } else {
+        outputDiv.textContent = markdownText;
+      }
       card.classList.remove('hidden');
 
       // Wait 150ms for DOM Reflow so Canvas dimensions are properly computed
@@ -1102,17 +1124,20 @@ ${targetJob ? `희망 직무: ${targetJob}` : '희망 직무: 자기소개서에
     }
 
     function renderVisualCharts() {
-      let topJobs = jobStore.slice(0, 3);
-      if (topJobs.length === 0) {
-        topJobs = [
-          { company: "우아한형제들", requiredSkills: ["Java", "Spring Boot"] },
-          { company: "네이버", requiredSkills: ["Java", "SQL"] },
-          { company: "카카오", requiredSkills: ["Spring", "Git"] }
-        ];
-      }
+      if (jobStore.length === 0) return;
 
-      const labels = topJobs.map(j => j.company || '추천기업');
-      const scores = topJobs.map(j => calculateMatchScore(['Java', 'Spring', 'Python', 'SQL', 'Git'], j, myLevel).score);
+      const topDetails = jobStore
+        .map(j => calculateMatchScore(lastMySkills, j, myLevel))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 3);
+      const labels = topDetails.map(d => d.company || '추천기업');
+      const scores = topDetails.map(d => d.score);
+      const top = topDetails[0];
+      const radarValues = [
+        Math.round(top.reqScore / 60 * 100),
+        Math.round(top.prefScore / 20 * 100),
+        top.expScore ? 100 : 0
+      ];
 
       const canvas1 = document.getElementById('matchScoreChart');
       const canvas2 = document.getElementById('skillRadarChart');
@@ -1149,10 +1174,10 @@ ${targetJob ? `희망 직무: ${targetJob}` : '희망 직무: 자기소개서에
       skillRadarChartObj = new Chart(ctx2, {
         type: 'radar',
         data: {
-          labels: ['필수 역량', '우대 역량', '경력 일치도', '프로젝트 연관', '성장 가능성'],
+          labels: ['필수 역량 매칭률', '우대 역량 매칭률', '경력 일치'],
           datasets: [{
-            label: '매칭 프로필',
-            data: [scores[0] || 85, (scores[0] || 85) * 0.85, 90, 85, 95],
+            label: '1순위 공고 매칭 프로필',
+            data: radarValues,
             backgroundColor: 'rgba(168, 85, 247, 0.3)',
             borderColor: '#c084fc',
             pointBackgroundColor: '#c084fc',
