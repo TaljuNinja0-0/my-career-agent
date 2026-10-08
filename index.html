@@ -1072,11 +1072,18 @@ ${targetJob ? `희망 직무: ${targetJob}` : '희망 직무: 자기소개서에
           }
 
           if (parsedObj.final) {
+            if (jobStore.length === 0) {
+              appendLog('ERROR', '⚠️ 공고 검색 없이 최종 보고서를 제출함 — 거부하고 검색 요청', '');
+              conversationHistory.push({
+                role: "user",
+                parts: [{ text: "[시스템] 아직 searchJobs로 실제 공고를 찾지 않았습니다. final을 제출하기 전에 반드시 searchJobs를 호출해 공고를 수집하세요." }]
+              });
+              continue;
+            }
             updateStepIndicator(5);
             appendLog('THOUGHT', '최종 에이전트 보고서 수락', '마크다운 및 차트 렌더링');
             renderFinalReport(parsedObj.final);
-            document.getElementById('startAgentBtn').disabled = false;
-            document.getElementById('startAgentBtn').classList.remove('opacity-50', 'cursor-not-allowed');
+            enableStartButton();
             return;
           }
 
